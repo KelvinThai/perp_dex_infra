@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rpc-config
+  namespace: perp-dex
+data:
+  RPC_ENDPOINT: "https://green-little-replica.solana-devnet.quiknode.pro/a4254b67640b9dcb3b0da6f2921e6b7ae00e71f6/"
+  WS_ENDPOINT: "wss://green-little-replica.solana-devnet.quiknode.pro/a4254b67640b9dcb3b0da6f2921e6b7ae00e71f6/"
+  DRIFT_ENV: "devnet"

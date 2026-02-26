@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dlob-api
+  namespace: perp-dex
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dlob-api
+  template:
+    metadata:
+      labels:
+        app: dlob-api
+    spec:
+      containers:
+      - name: api
+        image: custom-dlob:latest
+        command: ["node", "lib/index.js"]
+        env:
+        - name: ENV
+          value: "devnet"
+        - name: ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: rpc-config
+              key: RPC_ENDPOINT
+        - name: WS_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: rpc-config
+              key: WS_ENDPOINT
+        - name: PERP_MARKETS_TO_LOAD
+          value: "0,1,2,3"
+        - name: SPOT_MARKETS_TO_LOAD
+          value: "0"
+        - name: PORT
+          value: "6969"
+        - name: METRICS_PORT
+          value: "9464"
+        - name: USE_WEBSOCKET
+          value: "false"
+        - name: ELASTICACHE_HOST
+          value: "redis"
+        - name: ELASTICACHE_PORT
+          value: "6379"
+        - name: USE_REDIS
+          value: "true"
+        - name: REDIS_CLIENT
+          value: "DLOB"
+        - name: LOCAL_CACHE
+          value: "true"
+        - name: RUNNING_LOCAL
+          value: "true"
+        - name: BULK_ACCOUNT_LOADER_POLLING_INTERVAL
+          value: "10000"
+        - name: DISABLE_GPA_REFRESH
+          value: "true"
+        - name: RATE_LIMIT_CALLS_PER_SECOND
+          value: "30"
+        ports:
+        - containerPort: 6969
+          name: http
+        - containerPort: 9464
+          name: metrics
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 6969
+          initialDelaySeconds: 30
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dlob-api
+  namespace: perp-dex
+spec:
+  selector:
+    app: dlob-api
+  ports:
+  - name: http
+    port: 6969
+    targetPort: 6969

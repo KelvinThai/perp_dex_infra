@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oracle-updater
+  namespace: perp-dex
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oracle-updater
+  template:
+    metadata:
+      labels:
+        app: oracle-updater
+    spec:
+      containers:
+      - name: oracle-updater
+        image: custom-perp-bots:latest
+        args: ["--bot", "oracle-updater", "--market", "3"]
+        env:
+        - name: RPC_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: rpc-config
+              key: RPC_ENDPOINT
+        - name: PROGRAM_ID
+          value: "6prdU12bH7QLTHoNPhA3RF1yzSjrduLQg45JQgCMJ1ko"
+        - name: KEYPAIR_PATH
+          value: "/keys/admin-keypair.json"
+        volumeMounts:
+        - name: admin-key
+          mountPath: /keys
+          readOnly: true
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      - name: admin-key
+        secret:
+          secretName: admin-keypair

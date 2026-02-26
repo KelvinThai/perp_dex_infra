@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keeper-bots
+  namespace: perp-dex
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keeper-bots
+  template:
+    metadata:
+      labels:
+        app: keeper-bots
+    spec:
+      containers:
+      - name: keeper
+        image: custom-keeper:latest
+        args: ["--config-file", "/config/config.yaml"]
+        env:
+        - name: KEEPER_PRIVATE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: keeper-keys
+              key: KEEPER_PRIVATE_KEY
+        volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+        ports:
+        - containerPort: 8888
+          name: health
+        - containerPort: 9471
+          name: liquidator
+        - containerPort: 9472
+          name: trigger
+        - containerPort: 9473
+          name: funding
+        - containerPort: 9474
+          name: filler
+        - containerPort: 9475
+          name: settler
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8888
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+      volumes:
+      - name: config
+        configMap:
+          name: keeper-config

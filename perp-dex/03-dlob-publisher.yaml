@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dlob-publisher
+  namespace: perp-dex
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dlob-publisher
+  template:
+    metadata:
+      labels:
+        app: dlob-publisher
+    spec:
+      containers:
+      - name: publisher
+        image: custom-dlob:latest
+        command: ["node", "lib/publishers/dlobPublisher.js"]
+        env:
+        - name: ENV
+          value: "devnet"
+        - name: ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: rpc-config
+              key: RPC_ENDPOINT
+        - name: WS_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: rpc-config
+              key: WS_ENDPOINT
+        - name: PERP_MARKETS_TO_LOAD
+          value: "0,1,2,3"
+        - name: SPOT_MARKETS_TO_LOAD
+          value: "0"
+        - name: USE_WEBSOCKET
+          value: "false"
+        - name: USE_ORDER_SUBSCRIBER
+          value: "true"
+        - name: USE_GRPC
+          value: "false"
+        - name: ORDERBOOK_UPDATE_INTERVAL
+          value: "1000"
+        - name: ELASTICACHE_HOST
+          value: "redis"
+        - name: ELASTICACHE_PORT
+          value: "6379"
+        - name: USE_REDIS
+          value: "true"
+        - name: REDIS_CLIENT
+          value: "DLOB"
+        - name: LOCAL_CACHE
+          value: "true"
+        - name: RUNNING_LOCAL
+          value: "true"
+        - name: BULK_ACCOUNT_LOADER_POLLING_INTERVAL
+          value: "10000"
+        - name: EVENT_SUBSCRIBER_POLLING_INTERVAL
+          value: "10000"
+        - name: METRICS_PORT
+          value: "9465"
+        - name: DISABLE_GPA_REFRESH
+          value: "true"
+        - name: ENABLE_TOB_MONITORING
+          value: "true"
+        - name: TOB_MONITORING_ENABLED_PERP_MARKETS
+          value: "0,1,2"
+        ports:
+        - containerPort: 8080
+          name: health
+        - containerPort: 9465
+          name: metrics
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"

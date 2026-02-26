@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dlob-ws
+  namespace: perp-dex
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dlob-ws
+  template:
+    metadata:
+      labels:
+        app: dlob-ws
+    spec:
+      containers:
+      - name: ws
+        image: custom-dlob:latest
+        command: ["node", "lib/wsConnectionManager.js"]
+        env:
+        - name: WS_PORT
+          value: "6970"
+        - name: METRICS_PORT
+          value: "9467"
+        - name: ELASTICACHE_HOST
+          value: "redis"
+        - name: ELASTICACHE_PORT
+          value: "6379"
+        - name: USE_REDIS
+          value: "true"
+        - name: REDIS_CLIENT
+          value: "DLOB"
+        - name: LOCAL_CACHE
+          value: "true"
+        - name: RUNNING_LOCAL
+          value: "true"
+        ports:
+        - containerPort: 6970
+          name: ws
+        - containerPort: 9467
+          name: metrics
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dlob-ws
+  namespace: perp-dex
+spec:
+  selector:
+    app: dlob-ws
+  ports:
+  - name: ws
+    port: 6970
+    targetPort: 6970
