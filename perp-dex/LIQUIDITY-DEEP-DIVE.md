@@ -597,6 +597,184 @@ Currently `~/Perp_bots/src/bots/market-maker.ts` only runs on TEAM-PERP (market 
 
 ---
 
+---
+
+## Custom / Tokenless Perp Markets (TEAM-PERP)
+
+TEAM-PERP is a custom sports index market with no underlying token. This section explains how it works in the protocol and why no special fork changes are needed.
+
+### All Perp Markets Are Already Tokenless
+
+The Drift protocol doesn't link perp markets to any base token. There is no `base_asset_mint` field on `PerpMarket`. Every perp market — including SOL-PERP — is a **purely synthetic contract**:
+
+- "Base asset" is notional (virtual numbers in the AMM, not real tokens)
+- All settlement is in USDC (spot market index 0)
+- Positions are just accounting entries: "you're long 1 unit of market X"
+- The only thing that gives a market meaning is **its oracle**
+
+SOL-PERP doesn't actually involve SOL tokens. It's a contract that says "pay/receive USDC based on the Pyth SOL/USD price feed." TEAM-PERP is identical — "pay/receive USDC based on the PrelaunchOracle price."
+
+### The Only Difference: Oracle Source
+
+| | SOL/BTC/ETH-PERP | TEAM-PERP |
+|---|----------|-----------|
+| Oracle source | `PythPull` (external, autonomous) | `Prelaunch` (admin-controlled) |
+| Price comes from | Pyth network data publishers | `amm.last_mark_price_twap` (internal) |
+| Who updates it | Pyth network (permissionless) | Admin keypair (`7XAMFn...`) |
+| Staleness check | Yes — DLOB skips vAMM if oracle is stale | Skipped — DLOB has special handling for Prelaunch |
+| AMM mechanics | Identical | Identical |
+| Funding rate | Identical | Identical |
+| Liquidation | USDC settlement | USDC settlement |
+| DLOB/JIT/LP | Identical | Identical |
+
+### PerpMarket On-Chain Structure
+
+```
+PerpMarket {
+    amm: AMM {
+        oracle: Pubkey           → Pyth account OR PrelaunchOracle PDA
+        oracle_source: OracleSource → PYTH_PULL or Prelaunch
+        base_asset_reserve: u128 → virtual (not real tokens)
+        quote_asset_reserve: u128 → virtual (not real tokens)
+        sqrt_k: u128             → liquidity depth
+        peg_multiplier: u128     → anchors AMM price to oracle
+        ...
+    }
+    quote_spot_market_index: u16 → always 0 (USDC)
+    name: [u8; 32]              → "TEAM-PERP"
+    ...
+    // NO base_asset_mint field
+    // NO spot_market_index for base asset
+    // NO token reference of any kind
+}
+```
+
+The protocol reads the oracle account to get `(price, confidence, slot)` and doesn't care where the number came from — Pyth network or admin-updated PDA.
+
+### How the PrelaunchOracle Works
+
+The PrelaunchOracle is a PDA on-chain (`programs/drift/src/state/oracle.rs`):
+
+```rust
+pub struct PrelaunchOracle {
+    pub price: i64,               // Current price (set from mark TWAP)
+    pub max_price: i64,           // Price cap (circuit breaker)
+    pub confidence: u64,          // Bid-ask spread proxy
+    pub last_update_slot: u64,    // Freshness tracking
+    pub amm_last_update_slot: u64,// AMM slot at update time
+    pub perp_market_index: u16,   // Linked market (3 for TEAM-PERP)
+}
+```
+
+When the oracle-updater bot calls `update()`:
+```
+self.price = min(last_mark_price_twap, max_price)
+self.confidence = max(spread_twap, mark_std)
+```
+
+### The Circular Dependency (Important)
+
+The default PrelaunchOracle has a circular dependency:
+
+```
+Oracle price ← AMM mark TWAP ← Trading activity ← Oracle price (used for funding/liquidation)
+    ▲                                                          │
+    └──────────────────────────────────────────────────────────┘
+```
+
+This means:
+- **The market is self-referencing** — price is whatever traders agree it is
+- **Funding rate stays near zero** — mark ≈ oracle since oracle tracks mark
+- **No anchor to reality** — without external input, the price can drift anywhere
+- **`max_price` acts as the only circuit breaker**
+
+This is fine for testing. For production:
+
+### Breaking the Circularity (Production Strategy)
+
+For a real sports index market, you must **break the circular dependency** by setting oracle price from an external data source instead of from the AMM's mark TWAP.
+
+**Option 1: Direct admin oracle updates (current approach)**
+
+Your oracle-updater bot (`Perp_bots/src/bots/oracle-updater.ts`) calls `updatePrelaunchOracle` with a price derived from external data:
+
+```
+Sports API → oracle-updater bot → updatePrelaunchOracle tx → on-chain price
+```
+
+The bot replaces the random walk with a real data source (sports statistics API, game scores, team performance index). The AMM then prices around this externally-set oracle.
+
+**Option 2: Custom oracle program**
+
+Deploy a separate oracle program that aggregates data from multiple sources:
+
+```
+Data source A ─┐
+Data source B ──┼→ Oracle program → oracle account → Drift reads it
+Data source C ─┘
+```
+
+Change TEAM-PERP's `oracle_source` to point to this program. More trust-minimized than admin updates.
+
+**Option 3: Multi-sig oracle committee**
+
+Require 2-of-3 (or 3-of-5) signers to update the oracle:
+
+```
+Reporter 1 ─┐
+Reporter 2 ──┼→ Squads multi-sig → updatePrelaunchOracle
+Reporter 3 ─┘
+```
+
+Reduces single-admin risk. Users trust the price more because no single party controls it.
+
+### What the Protocol Does Identically for TEAM-PERP
+
+Every component in the 4-layer liquidity waterfall works the same:
+
+| Component | How it uses the oracle | Token dependency |
+|-----------|----------------------|------------------|
+| **JIT Auction** | Derives auction start/end from oracle ± 0.5% | None |
+| **DLOB Matching** | Filler bot uses oracle for price validation | None |
+| **AMM Pricing** | `peg_multiplier` auto-adjusts toward oracle | None — reserves are virtual |
+| **AMM Spreads** | Widen/narrow based on oracle vs mark divergence | None |
+| **Funding Rate** | `mark_twap - oracle_twap` | None — oracle is just a price number |
+| **Liquidation** | Checks margin using oracle price for position value | Settles in USDC only |
+| **LP Settlement** | Uses oracle for PnL calculation | Settles in USDC only |
+| **Insurance Fund** | Covers bad debt in USDC | No base token involved |
+
+### DLOB Special Handling for Prelaunch Markets
+
+The DLOB server has one special case for Prelaunch oracle markets (`dlob-server/src/dlob-subscriber/DLOBSubscriberIO.ts`):
+
+```typescript
+// Skip staleness check for prelaunch markets
+const isPerpMarketAndPrelaunchMarket =
+    marketType === 'perp' &&
+    isVariant(market.amm.oracleSource, 'prelaunch');
+
+if (dlobSlot - oracleSlot > STALE_ORACLE_REMOVE_VAMM_THRESHOLD
+    && !isPerpMarketAndPrelaunchMarket) {   // ← skip for prelaunch
+    includeVamm = false;
+}
+```
+
+Without this, the DLOB would remove vAMM quotes for TEAM-PERP whenever the PrelaunchOracle's `amm_last_update_slot` falls behind (which happens when there's no trading activity to update the AMM TWAP). This fix was already applied to your fork.
+
+### Practical Implications for Operating TEAM-PERP
+
+| Concern | Token-backed market (SOL-PERP) | Tokenless market (TEAM-PERP) |
+|---------|-------------------------------|------------------------------|
+| **Oracle goes stale** | Pyth usually keeps updating; if it stops, trading degrades | You must keep the oracle-updater bot running or price freezes |
+| **Funding rate** | Converges perp price toward spot (real external anchor) | Converges toward admin-set oracle (only as good as your data source) |
+| **Arbitrage** | CEX/DEX arb keeps prices efficient | No external market to arb against — price discovery is purely internal |
+| **Liquidity** | Attracts arb bots and professional MMs who trade SOL everywhere | Only attracts speculators — no natural hedging demand |
+| **Risk** | AMM risk is bounded by real-world SOL price behavior | AMM risk depends entirely on oracle accuracy and market design |
+
+**Bottom line**: The fork doesn't need any code changes for TEAM-PERP. The protocol is designed to support arbitrary synthetic markets. The challenge is operational — maintaining a trustworthy oracle and bootstrapping liquidity without an external reference market.
+
+---
+
 ## Source Code Reference
 
 | Component | File |
