@@ -4,13 +4,14 @@
 
 1. [Technical Operations](#1-technical-operations)
 2. [Market Parameters & Tuning](#2-market-parameters--tuning)
-3. [Risk Management](#3-risk-management)
-4. [Business Operations](#4-business-operations)
-5. [Regulatory & Legal](#5-regulatory--legal)
-6. [Growth & Go-to-Market](#6-growth--go-to-market)
-7. [Team & Organizational Structure](#7-team--organizational-structure)
-8. [Financial Model](#8-financial-model)
-9. [Appendix: Runbooks](#9-appendix-runbooks)
+3. [4-Layer Liquidity System](#3-4-layer-liquidity-system)
+4. [Risk Management](#4-risk-management)
+5. [Business Operations](#5-business-operations)
+6. [Regulatory & Legal](#6-regulatory--legal)
+7. [Growth & Go-to-Market](#7-growth--go-to-market)
+8. [Team & Organizational Structure](#8-team--organizational-structure)
+9. [Financial Model](#9-financial-model)
+10. [Appendix: Runbooks](#10-appendix-runbooks)
 
 ---
 
@@ -286,9 +287,424 @@ These parameters are set on-chain per market via admin transactions:
 
 ---
 
-## 3. Risk Management
+## 3. 4-Layer Liquidity System
 
-### 3.1 Types of Risk
+Drift v2 uses a unique 4-layer liquidity waterfall. Every taker order flows through these layers in sequence until fully filled. This is fundamentally different from a traditional orderbook or simple AMM — it combines the best of both with two additional layers.
+
+### 3.1 Order Fill Waterfall
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ TAKER ORDER PLACED                                              │
+│ Enters auction with start_price, end_price, duration (slots)   │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ LAYER 1: JIT AUCTION (0 → auction_duration slots)              │
+│                                                                 │
+│ Price improves linearly from start → end over duration.         │
+│ Market makers (JIT makers) compete to fill at auction price.    │
+│ AMM also participates if amm_jit_intensity > 0.                │
+│                                                                 │
+│ Fill result: ORDER_FILLED_WITH_AMM_JIT                         │
+│ If not fully filled → continue ↓                               │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ LAYER 2: DLOB (after auction completes)                        │
+│                                                                 │
+│ Filler bot scans resting limit orders from the orderbook.       │
+│ Matches up to 6 makers per fill transaction.                    │
+│ Orders must cross: taker bid ≥ maker ask (or vice versa).      │
+│                                                                 │
+│ Fill result: ORDER_FILLED_WITH_MATCH                           │
+│ If not fully filled → continue ↓                               │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ LAYER 3: AMM BACKSTOP (constant-product vAMM)                  │
+│                                                                 │
+│ Virtual AMM fills remaining size at reserve_price ± spread.     │
+│ AMM takes the opposite side (becomes counterparty).             │
+│ Slippage depends on sqrt_k (liquidity depth).                   │
+│                                                                 │
+│ Fill result: ORDER_FILLED_WITH_AMM                             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ LAYER 4: LP POOL (passive liquidity providers)                 │
+│                                                                 │
+│ LPs share the AMM's position pro-rata based on LP shares.       │
+│ They earn slippage, spread, and funding collected by the AMM.   │
+│ They absorb directional risk alongside the AMM.                │
+│                                                                 │
+│ Fill result: ORDER_FILLED_WITH_AMM_JIT_LP_SPLIT                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why this matters**: A taker order gets the best possible price. JIT makers compete to offer better prices than the AMM. Limit orders provide additional depth. The AMM guarantees every order can fill (no "no liquidity" errors). LPs allow anyone to passively provide depth.
+
+### 3.2 Layer 1: JIT (Just-in-Time) Auction
+
+When a taker order is placed, it enters a short auction before matching. This gives market makers a window to offer better prices than the AMM.
+
+#### How It Works
+
+1. Order is placed with `auction_start_price`, `auction_end_price`, and `auction_duration` (in Solana slots, ~400ms each)
+2. During the auction, the fill price improves linearly from start to end
+3. JIT makers (external bots) and the AMM itself can submit counter-orders at the auction price
+4. The taker gets the best available price
+
+#### Auction Price Calculation
+
+**Fixed auction** (standard market/limit orders):
+```
+auction_price = start_price + (end_price - start_price) × slots_elapsed / auction_duration
+```
+
+**Oracle offset auction** (oracle-pegged orders):
+```
+auction_price = oracle_price + interpolated_offset
+```
+Where offset interpolates from `auction_start_price_offset` to `auction_end_price_offset`.
+
+**Price derivation bounds** (`AUCTION_DERIVE_PRICE_FRACTION = 200`, i.e. 0.5%):
+- For a long order with a limit price better than oracle:
+  - Start: `min(limit_price - 0.5%, oracle_price - 0.5%)`
+  - End: `limit_price`
+- This ensures the auction always starts at a price favorable to makers and ends at the taker's limit.
+
+#### AMM JIT Participation
+
+The AMM itself participates in JIT auctions based on:
+
+```
+amm_wants_to_jit_make = true if:
+  - amm_jit_intensity > 0  (parameter, range 0-200)
+  - AMM has inventory it wants to reduce
+    (e.g., AMM is short and taker is buying → AMM sells to reduce short)
+```
+
+**JIT size calculation** (`amm_jit.rs`):
+1. Start with 50% of maker's base amount
+2. If auction price is >5 bps from oracle → reduce (wash trade protection)
+3. If market is imbalanced (max_bids/min_asks ≥ 1.5) → increase to full maker size
+4. If market is balanced → reduce to 25% of maker size
+5. Scale by `amm_jit_intensity / 100`
+6. Cap to AMM's current position size
+7. Round to `order_step_size`
+
+#### JIT Maker Bot
+
+The keeper-bots-v2 repo includes a JIT maker bot (`src/bots/jitMaker.ts`):
+
+```yaml
+# jit-maker-config.yaml
+marketType: "perp"
+marketIndexes: [0, 1, 2, 3]     # SOL, BTC, ETH, TEAM
+subaccounts: [1]
+targetLeverage: 1.0
+aggressivenessBps: 10           # How aggressively to bid in auctions
+```
+
+Uses `JitterSniper` or `JitterShotgun` strategies from the jit-proxy to place counter-orders during the auction window. Not currently in your `custom-dex.config.yaml` enabled bots — **consider enabling it for tighter spreads**.
+
+#### Key Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `min_perp_auction_duration` | 10 slots (~4s) | Minimum auction length |
+| `amm_jit_intensity` | 0-200 | AMM participation (0 = disabled) |
+| `AUCTION_DERIVE_PRICE_FRACTION` | 200 (0.5%) | Price bound derivation |
+| Wash trade distance | 5 bps | Triggers JIT reduction |
+| Imbalance threshold | 1.5× ratio | Triggers aggressive JIT |
+
+### 3.3 Layer 2: DLOB (Decentralized Limit Order Book)
+
+After the auction completes, the order can match against resting limit orders on the DLOB.
+
+#### Order Types on the DLOB
+
+| Node Type | Description | Sorting |
+|-----------|-------------|---------|
+| **RestingLimitOrderNode** | Post-only or auction-complete limit orders | By price (best first) |
+| **TakingLimitOrderNode** | Limit orders still in auction | By slot (oldest first) |
+| **FloatingLimitOrderNode** | Oracle-offset limit orders (`oraclePriceOffset`) | By offset |
+| **MarketOrderNode** | Market orders during auction | By slot |
+| **TriggerOrderNode** | Stop-loss, take-profit (conditional) | By trigger price |
+
+#### When an Order Becomes "Resting"
+
+A limit order becomes a resting maker order when:
+```
+is_resting = post_only OR auction_complete(current_slot > order_slot + auction_duration)
+```
+
+Only resting orders can be matched against incoming taker orders. This prevents front-running during the auction.
+
+#### Filler Bot Matching
+
+The keeper filler bot (`src/bots/filler.ts`):
+1. Subscribes to DLOB via `DLOBSubscriber` (polls every ~6 seconds)
+2. Identifies `NodeToFill` — a taker order with crossing maker orders
+3. Selects up to `MAX_MAKERS_PER_FILL = 6` unique makers per transaction
+4. Submits fill transaction on-chain
+
+**Matching rules** (enforced on-chain in `orders.rs`):
+- Maker and taker must be different users (no self-matching)
+- Taker cannot be post-only if it would take liquidity
+- For limit-vs-limit: maker must be older than taker (or post-only)
+- Orders must cross: for a long taker, `taker_price ≥ maker_ask`
+
+#### DLOB Infrastructure
+
+```
+On-chain orders → DLOB Publisher → Redis → DLOB API (HTTP :6969)
+                                         → DLOB WS  (WS :6970)
+                                         → Filler Bot (reads for matching)
+```
+
+The DLOB Publisher polls on-chain accounts every `ORDERBOOK_UPDATE_INTERVAL` (1000ms) and writes the aggregated orderbook to Redis. The API and WS manager serve this data to the frontend and other consumers.
+
+### 3.4 Layer 3: AMM (Virtual Automated Market Maker)
+
+The AMM is the backstop — it guarantees every order can fill even when there are no makers. It uses a constant-product formula (`x × y = k`) adapted for perpetual futures.
+
+#### AMM Pricing
+
+```
+reserve_price = quote_asset_reserve × peg_multiplier / base_asset_reserve
+
+bid_price = reserve_price × (1 - long_spread)
+ask_price = reserve_price × (1 + short_spread)
+```
+
+Where:
+- `base_asset_reserve` / `quote_asset_reserve`: virtual reserves (not real tokens)
+- `peg_multiplier`: anchors the AMM price to the oracle price
+- `sqrt_k`: controls depth — higher = less slippage per unit traded
+- `long_spread` / `short_spread`: dynamic spreads that widen with inventory imbalance
+
+#### Key AMM State Variables
+
+| Field | Precision | Description |
+|-------|-----------|-------------|
+| `base_asset_reserve` | AMM_RESERVE_PRECISION | Virtual base reserves |
+| `quote_asset_reserve` | AMM_RESERVE_PRECISION | Virtual quote reserves |
+| `sqrt_k` | AMM_RESERVE_PRECISION | Liquidity depth (√k) |
+| `peg_multiplier` | PEG_PRECISION | Oracle price anchor |
+| `concentration_coef` | PERCENTAGE_PRECISION | Liquidity concentration around mid |
+| `base_asset_amount_with_amm` | BASE_PRECISION | AMM's net position (inventory) |
+| `base_asset_amount_long` | BASE_PRECISION | Total long OI |
+| `base_asset_amount_short` | BASE_PRECISION | Total short OI |
+| `long_spread` | PERCENTAGE_PRECISION | Bid spread from reserve price |
+| `short_spread` | PERCENTAGE_PRECISION | Ask spread from reserve price |
+| `max_base_asset_reserve` | AMM_RESERVE_PRECISION | Cap on base reserves (limits OI) |
+| `min_base_asset_reserve` | AMM_RESERVE_PRECISION | Floor on base reserves |
+
+#### AMM Inventory Management
+
+The AMM adjusts spreads based on its net position:
+- **Balanced** (net position ≈ 0): spreads are tight, prices close to oracle
+- **Long-heavy** (AMM is short): ask spread widens to discourage more shorts, bid tightens to attract longs
+- **Short-heavy** (AMM is long): bid spread widens, ask tightens
+
+This self-correcting mechanism incentivizes traders to rebalance the AMM's inventory.
+
+#### AMM as Revenue Source
+
+The AMM earns from:
+1. **Bid-ask spread**: every taker pays the spread
+2. **Slippage**: larger orders move the price, AMM captures the difference
+3. **Funding rate collection**: when the majority side pays funding, the AMM collects
+
+The AMM loses when:
+1. **Price moves against its inventory**: AMM is short and price drops → unrealized loss
+2. **Oracle divergence**: if mark price diverges from oracle, arbitrageurs extract value
+
+### 3.5 Layer 4: LP (Liquidity Providers)
+
+LPs are passive participants who provide capital to deepen the AMM. They share in the AMM's revenue and risk.
+
+#### How LP Works
+
+1. **User mints LP shares** by depositing collateral into a perp market's LP pool
+2. **LP shares represent a pro-rata claim** on the AMM's position and accumulated fees
+3. **As trades happen**, the AMM's position changes — LPs absorb a proportional share of this position
+4. **LPs earn** slippage, spread, and funding collected by the AMM
+5. **LPs can burn shares** to exit, settling their accumulated position and PnL
+
+#### LP State Tracking
+
+Per-user (in `PerpPosition`):
+```
+lp_shares: u64                          — number of LP shares held
+last_base_asset_amount_per_lp: i64      — snapshot at last settlement
+last_quote_asset_amount_per_lp: i64     — snapshot at last settlement
+```
+
+Per-market (in `AMM`):
+```
+base_asset_amount_per_lp: i128          — cumulative base earned per LP share
+quote_asset_amount_per_lp: i128         — cumulative quote earned per LP share
+```
+
+#### LP Settlement
+
+When an LP settles (or is settled by the PnL settler keeper bot):
+```
+delta_base = (current_base_per_lp - last_base_per_lp) × lp_shares
+delta_quote = (current_quote_per_lp - last_quote_per_lp) × lp_shares
+```
+
+This delta becomes a real perp position on the LP's account, which they can then close normally.
+
+#### What LPs Earn
+
+| Revenue source | Description |
+|----------------|-------------|
+| Slippage | Takers pay slippage when trading against AMM; LPs collect proportional share |
+| Bid-ask spread | Captured in reserve price adjustments |
+| Funding rates | When takers pay funding, LPs collect it as counterparty |
+| Imbalance correction | Peg multiplier adjustments favor LPs when market rebalances |
+
+#### LP Risks
+
+| Risk | Description | Mitigation |
+|------|-------------|------------|
+| **Inventory/directional risk** | LPs take opposite side of all trades. If all takers are long, LPs are short. | Diversify across markets, set position limits |
+| **Impermanent loss** | Similar to Uniswap — if price moves far from entry, LPs lose vs. holding | Monitor and exit if divergence is large |
+| **Funding rate risk** | If takers have extreme funding exposure, LPs must fund it | Monitor funding rates |
+| **Liquidation risk** | LP's perp position can be liquidated if collateral drops | Maintain adequate margin |
+| **Oracle divergence** | Arbitrageurs extract value when mark ≠ oracle, at LP expense | Ensure oracle is accurate and fresh |
+
+#### LP Pool (Advanced)
+
+The protocol also supports a diversified **LPPool** (`state/lp_pool.rs`) that spans multiple markets:
+- Users mint/redeem pool-level LP tokens
+- Pool allocates capital across constituent markets (SOL, BTC, ETH, etc.)
+- Revenue is distributed across constituents
+- Provides better diversification than single-market LP
+
+### 3.6 Liquidity Operations & Tuning
+
+#### Current Setup
+
+Your deployed bots provide liquidity through two layers:
+
+| Bot | Layer | Markets | Config |
+|-----|-------|---------|--------|
+| Market Maker (`custom-perp-bots`) | DLOB (Layer 2) — places resting limit orders | TEAM-PERP (3) | `~/Perp_bots/` |
+| Filler (`keeper-bots-v2`) | DLOB (Layer 2) — matches crossing orders | All (0-3) | `custom-dex.config.yaml` |
+| AMM (on-chain) | AMM (Layer 3) — backstop fills | All (0-3) | On-chain parameters |
+
+**Not currently enabled**:
+- JIT Maker bot (Layer 1) — exists in `keeper-bots-v2/src/bots/jitMaker.ts` but not in `enabledBots`
+- LP provision (Layer 4) — no users providing LP yet
+
+#### Enabling the JIT Maker Bot
+
+To activate Layer 1 liquidity, add the JIT maker to your keeper config:
+
+```yaml
+# Add to custom-dex.config.yaml enabledBots:
+enabledBots:
+  - filler
+  - liquidator
+  - trigger
+  - fundingRateUpdater
+  - userPnlSettler
+  - jitMaker              # ← ADD THIS
+
+botConfigs:
+  # ... existing configs ...
+
+  jitMaker:
+    botId: "custom-dex-jit-maker"
+    dryRun: false
+    metricsPort: 9476
+    marketType: "perp"
+    marketIndexes: [0, 1, 2, 3]
+    subaccounts: [1]
+    targetLeverage: 1.0
+    spreadBps: 10              # How tight to quote vs oracle
+```
+
+**Impact**: takers get better fill prices (tighter than AMM spread), and the JIT maker earns the difference between auction price and AMM price.
+
+#### Bootstrapping LP Liquidity (Layer 4)
+
+To attract LPs:
+1. **Seed LP yourself** — use admin account to provide initial LP on each market
+2. **LP incentives** — offer fee rebates or token rewards for LP providers
+3. **Communicate risk** — LPs need to understand they're taking directional risk
+4. **Monitor LP PnL** — if LPs are consistently losing, spreads may be too tight or AMM parameters need adjustment
+
+#### Liquidity Depth Targets by Phase
+
+| Phase | L2 Depth (1% from mid) | Source |
+|-------|----------------------|--------|
+| Alpha | $5K-10K | Market maker bot + AMM |
+| Beta | $50K-100K | + JIT maker + early LPs |
+| Growth | $500K-1M | + Professional MMs + LP incentives |
+| Mature | $5M+ | + LP pool + aggregator integrations |
+
+#### Key Tuning Levers (by layer)
+
+**Layer 1 (JIT)**:
+- `amm_jit_intensity`: 0=disabled, 100=normal, 200=aggressive. Start at 50-100.
+- `min_perp_auction_duration`: longer = more time for JIT makers, but slower fills
+- JIT maker `spreadBps`: tighter = better fills for takers, more risk for maker
+
+**Layer 2 (DLOB)**:
+- Market maker bot spread and depth settings in `~/Perp_bots/src/bots/market-maker.ts`
+- Filler `fillerPollingInterval`: currently 6000ms, lower = faster matching
+- `MAX_MAKERS_PER_FILL`: 6 (hardcoded) — limits how many orders match per tx
+
+**Layer 3 (AMM)**:
+- `sqrt_k`: higher = deeper liquidity, less slippage. Critical parameter.
+- `peg_multiplier`: should track oracle. Drift auto-adjusts this.
+- `base_spread`: minimum spread. Too tight = AMM takes more risk. Too wide = bad UX.
+- `max_spread`: cap on dynamic spread widening.
+- `concentration_coef`: higher = more liquidity concentrated near mid price.
+
+**Layer 4 (LP)**:
+- Insurance fund allocation (protects LPs from bad debt)
+- LP fee share percentage
+- Minimum LP share size
+
+### 3.7 Timing Reference
+
+| Event | Timing | Unit |
+|-------|--------|------|
+| Solana slot | ~400ms | wall clock |
+| Auction duration (min) | 10 slots | ~4 seconds |
+| Filler scan interval | 6000ms | configurable |
+| DLOB orderbook update | 1000ms | `ORDERBOOK_UPDATE_INTERVAL` |
+| Funding rate update | 1 hour | on-chain |
+| LP settlement | triggered by PnL settler bot | periodic |
+
+### 3.8 Source Code Reference
+
+| Component | File |
+|-----------|------|
+| Auction math | `protocol-v2/programs/drift/src/math/auction.rs` |
+| JIT calculation | `protocol-v2/programs/drift/src/math/amm_jit.rs` |
+| Order matching | `protocol-v2/programs/drift/src/math/matching.rs` |
+| Order controller | `protocol-v2/programs/drift/src/controller/orders.rs` |
+| AMM state | `protocol-v2/programs/drift/src/state/perp_market.rs` |
+| LP controller | `protocol-v2/programs/drift/src/controller/lp.rs` |
+| LP pool state | `protocol-v2/programs/drift/src/state/lp_pool.rs` |
+| DLOB SDK | `protocol-v2/sdk/src/dlob/` |
+| Filler bot | `keeper-bots-v2/src/bots/filler.ts` |
+| JIT maker bot | `keeper-bots-v2/src/bots/jitMaker.ts` |
+| Market maker bot | `Perp_bots/src/bots/market-maker.ts` |
+
+---
+
+## 4. Risk Management
+
+### 4.1 Types of Risk
 
 #### Market Risk (protocol takes directional exposure)
 - The AMM acts as counterparty to traders. If all traders are long and price goes up, the AMM (and protocol) loses money.
@@ -312,7 +728,7 @@ These parameters are set on-chain per market via admin transactions:
 - Infrastructure failures, key compromise, human error
 - Mitigation: monitoring, alerting, key management, runbooks
 
-### 3.2 Insurance Fund
+### 4.2 Insurance Fund
 
 The insurance fund is the backstop against socialized losses.
 
@@ -342,7 +758,7 @@ For early launch, you'll likely need to **seed the insurance fund** from your ow
 - Insurance fund = 0 → consider pausing all trading, assess damage
 - Multiple cascading liquidations in short period → potential oracle manipulation or flash crash
 
-### 3.3 Liquidation Engine
+### 4.3 Liquidation Engine
 
 The liquidator keeper bot monitors all positions and liquidates those below maintenance margin.
 
@@ -366,7 +782,7 @@ The liquidator keeper bot monitors all positions and liquidates those below main
 - Monitor liquidator success rate
 - Set conservative margin parameters for volatile/illiquid markets (TEAM-PERP)
 
-### 3.4 TEAM-PERP Oracle Risk (Special Section)
+### 4.4 TEAM-PERP Oracle Risk (Special Section)
 
 TEAM-PERP uses a PrelaunchOracle controlled by your admin keypair. This creates unique risks:
 
@@ -393,9 +809,9 @@ TEAM-PERP uses a PrelaunchOracle controlled by your admin keypair. This creates 
 
 ---
 
-## 4. Business Operations
+## 5. Business Operations
 
-### 4.1 Revenue Streams
+### 5.1 Revenue Streams
 
 | Revenue source | Description | Typical range |
 |----------------|-------------|---------------|
@@ -423,7 +839,7 @@ Growth:
   Revenue: ($50M × 0.0003 × 30) + ($5K × 30) = $450K + $150K = $600K/month
 ```
 
-### 4.2 Cost Structure
+### 5.2 Cost Structure
 
 #### Fixed costs
 
@@ -457,7 +873,7 @@ Growth:
 | Legal counsel | $60K-240K | Retainer or in-house |
 | **Total team (6)** | **$660K-1.32M** | Can start with 2-3 people |
 
-### 4.3 Competitive Landscape
+### 5.3 Competitive Landscape
 
 **Direct competitors (Solana perp DEXs)**:
 - **Drift Protocol**: the upstream of your fork. Established, audited, high TVL.
@@ -475,7 +891,7 @@ Growth:
 - Jupiter adds custom markets (they have the user base)
 - A sports betting platform adds perp-style contracts (they have the audience)
 
-### 4.4 Fee Strategy
+### 5.4 Fee Strategy
 
 **Phase 1: Bootstrapping (0-6 months)**
 - Taker: 3 bps
@@ -504,7 +920,7 @@ Growth:
 | $1M - $10M | 4 bps | -0.5 bps |
 | > $10M | 3 bps | -1 bps |
 
-### 4.5 Liquidity Bootstrapping
+### 5.5 Liquidity Bootstrapping
 
 The cold start problem: no liquidity → no traders → no liquidity.
 
@@ -531,7 +947,7 @@ The cold start problem: no liquidity → no traders → no liquidity.
 - Wallet integrations (Phantom, Solflare)
 - Portfolio tracker integrations (Zapper, DeBank)
 
-### 4.6 User Acquisition
+### 5.6 User Acquisition
 
 **Target audiences**:
 
@@ -552,9 +968,9 @@ The cold start problem: no liquidity → no traders → no liquidity.
 
 ---
 
-## 5. Regulatory & Legal
+## 6. Regulatory & Legal
 
-### 5.1 Classification Risk
+### 6.1 Classification Risk
 
 Your platform could be classified as:
 
@@ -567,7 +983,7 @@ Your platform could be classified as:
 
 **The admin key problem**: Because you hold the admin keypair, control the oracle, and run the infrastructure, regulators in most jurisdictions will consider you the **operator** of the exchange, regardless of the code being on Solana.
 
-### 5.2 Jurisdiction Analysis
+### 6.2 Jurisdiction Analysis
 
 | Jurisdiction | Feasibility | Requirements | Notes |
 |--------------|-------------|--------------|-------|
@@ -581,7 +997,7 @@ Your platform could be classified as:
 | **Panama** | Easy | Minimal regulation | Low barrier, less credibility |
 | **El Salvador** | Easy | Minimal regulation | Bitcoin-friendly |
 
-### 5.3 Recommended Legal Structure
+### 6.3 Recommended Legal Structure
 
 **Minimum viable legal setup**:
 
@@ -605,7 +1021,7 @@ Your platform could be classified as:
    - Tier 2: ID verification for higher limits
    - Provider: Jumio, Onfido, or Synaps
 
-### 5.4 TEAM-PERP Specific Legal Risk
+### 6.4 TEAM-PERP Specific Legal Risk
 
 A sports-linked perpetual future is a novel product that sits in a gray area:
 
@@ -619,7 +1035,7 @@ A sports-linked perpetual future is a novel product that sits in a gray area:
 - Document the methodology publicly
 - Get a legal opinion letter from a qualified attorney
 
-### 5.5 Legal Action Items (Priority Order)
+### 6.5 Legal Action Items (Priority Order)
 
 1. **Engage crypto-specialized law firm** (cost: $10K-30K initial)
    - Recommended: Anderson Kill, Debevoise, Fenwick & West, Latham & Watkins (US); Walkers (offshore)
@@ -632,9 +1048,9 @@ A sports-linked perpetual future is a novel product that sits in a gray area:
 
 ---
 
-## 6. Growth & Go-to-Market
+## 7. Growth & Go-to-Market
 
-### 6.1 Launch Phases
+### 7.1 Launch Phases
 
 #### Phase 0: Internal Testing (current)
 - Duration: 2-4 weeks
@@ -691,7 +1107,7 @@ A sports-linked perpetual future is a novel product that sits in a gray area:
   - [ ] Institutional features (sub-accounts, API access, FIX protocol)
   - [ ] Advanced order types (TWAP, iceberg, bracket)
 
-### 6.2 Key Metrics by Phase
+### 7.2 Key Metrics by Phase
 
 | Metric | Alpha | Beta | Growth | Mature |
 |--------|-------|------|--------|--------|
@@ -705,9 +1121,9 @@ A sports-linked perpetual future is a novel product that sits in a gray area:
 
 ---
 
-## 7. Team & Organizational Structure
+## 8. Team & Organizational Structure
 
-### 7.1 Minimum Viable Team (Phase 1-2)
+### 8.1 Minimum Viable Team (Phase 1-2)
 
 | Role | Responsibilities | Skills needed |
 |------|-----------------|---------------|
@@ -717,7 +1133,7 @@ A sports-linked perpetual future is a novel product that sits in a gray area:
 
 Total: 2-3 people. One person can wear multiple hats early on.
 
-### 7.2 Growth Team (Phase 3)
+### 8.2 Growth Team (Phase 3)
 
 | Role | Responsibilities |
 |------|-----------------|
@@ -731,7 +1147,7 @@ Total: 2-3 people. One person can wear multiple hats early on.
 
 Total: 5-6 people + legal retainer.
 
-### 7.3 Key Hiring Priorities
+### 8.3 Key Hiring Priorities
 
 In order of impact:
 
@@ -741,9 +1157,9 @@ In order of impact:
 
 ---
 
-## 8. Financial Model
+## 9. Financial Model
 
-### 8.1 Funding Requirements
+### 9.1 Funding Requirements
 
 | Phase | Duration | Funding needed | Primary costs |
 |-------|----------|---------------|---------------|
@@ -758,7 +1174,7 @@ In order of impact:
 - Venture capital (after proving PMF with volume metrics)
 - Token sale (after legal framework established)
 
-### 8.2 Break-even Analysis
+### 9.2 Break-even Analysis
 
 ```
 Monthly fixed costs (team of 3 + infra): ~$30,000
@@ -772,7 +1188,7 @@ Break-even volume at 3 bps net fee:
 
 For context, mid-tier Solana perp DEXs do $5-50M daily volume. Top tier (Jupiter Perps) does $100M+.
 
-### 8.3 Token Economics (if applicable)
+### 9.3 Token Economics (if applicable)
 
 If you decide to launch a governance/utility token:
 
@@ -792,9 +1208,9 @@ If you decide to launch a governance/utility token:
 
 ---
 
-## 9. Appendix: Runbooks
+## 10. Appendix: Runbooks
 
-### 9.1 Runbook: Service Recovery
+### 10.1 Runbook: Service Recovery
 
 **Pod in CrashLoopBackOff**:
 ```bash
@@ -816,7 +1232,7 @@ kubectl -n perp-dex edit deployment/<deployment-name>
 kubectl apply -f <manifest>.yaml
 ```
 
-### 9.2 Runbook: Keeper Wallet Top-up
+### 10.2 Runbook: Keeper Wallet Top-up
 
 ```bash
 # Check keeper wallet balance
@@ -829,7 +1245,7 @@ solana transfer <keeper-pubkey> 5 \
   --allow-unfunded-recipient
 ```
 
-### 9.3 Runbook: Emergency Market Pause
+### 10.3 Runbook: Emergency Market Pause
 
 If you need to halt trading on a market (oracle failure, exploit detected):
 
@@ -842,7 +1258,7 @@ npx ts-node --transpile-only scripts/pauseMarket.ts --market-index 3
 
 Note: implement this script before mainnet launch. It should call `updatePerpMarketStatus` to set the market to `Paused`.
 
-### 9.4 Runbook: Oracle Updater Recovery (TEAM-PERP)
+### 10.4 Runbook: Oracle Updater Recovery (TEAM-PERP)
 
 ```bash
 # 1. Check oracle updater logs
@@ -859,7 +1275,7 @@ cd ~/Perp_bots
 npx ts-node --transpile-only scripts/manualOracleUpdate.ts --price <correct-price>
 ```
 
-### 9.5 Runbook: Insurance Fund Check
+### 10.5 Runbook: Insurance Fund Check
 
 ```bash
 # Check insurance fund balance on-chain
@@ -872,7 +1288,7 @@ npx ts-node --transpile-only scripts/checkInsuranceFund.ts
 # 3. Investigate cause (was there a large liquidation? oracle error?)
 ```
 
-### 9.6 Runbook: Full Redeployment
+### 10.6 Runbook: Full Redeployment
 
 ```bash
 cd ~/k8s/perp-dex
